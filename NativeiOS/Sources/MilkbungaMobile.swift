@@ -14,6 +14,13 @@ struct Preset: Codable, Equatable {
     var website = "https://example.com"
     var appearance = "Sistema"
 }
+struct WebShortcut: Codable, Identifiable {
+    var id = UUID()
+    var label: String
+    var url: String
+    var icon: Data?
+    var fullscreen: Bool
+}
 struct ExportFile: FileDocument {
     static var readableContentTypes: [UTType] { [.data, .json] }
     var data: Data
@@ -28,6 +35,9 @@ struct Dashboard: View {
     @AppStorage("preset") private var saved = Data()
     @State private var preset = Preset()
     @State private var iconData: Data?
+    @AppStorage("shortcuts") private var savedShortcuts = Data()
+    @State private var shortcuts: [WebShortcut] = []
+    @State private var fullscreen = false
     @State private var photo: PhotosPickerItem?
     @State private var export: ExportFile?
     @State private var exportType: UTType = .json
@@ -83,6 +93,7 @@ struct Dashboard: View {
                 }
                 Section("Aplicar") {
                     Button("Exportar perfil de atalho web") { createProfile() }
+                    Button("Exportar coleção de atalhos") { createProfile(collection: true) }.disabled(shortcuts.isEmpty)
                     Button("Exportar projeto JSON") { savePreset() }
                     Button("Importar projeto JSON") { importing = true }
                     Button("Redefinir preferências", role: .destructive) { preset = Preset(); iconData = nil }
@@ -94,7 +105,10 @@ struct Dashboard: View {
         }
         .tint(.indigo)
         .preferredColorScheme(preset.appearance == "Claro" ? .light : preset.appearance == "Escuro" ? .dark : nil)
-        .onAppear { if let p = try? JSONDecoder().decode(Preset.self, from: saved) { preset = p } }
+        .onAppear {
+            if let p = try? JSONDecoder().decode(Preset.self, from: saved) { preset = p }
+            if let items = try? JSONDecoder().decode([WebShortcut].self, from: savedShortcuts) { shortcuts = items }
+        }
         .onChange(of: preset) { p in if let d = try? JSONEncoder().encode(p) { saved = d } }
         .fileExporter(isPresented: $exporting, document: export, contentType: exportType, defaultFilename: exportName) { result in
             switch result { case .success: report("Arquivo exportado."); case .failure(let error): report(error.localizedDescription) }
@@ -151,8 +165,25 @@ struct Dashboard: View {
             Section("Atalho web") {
                 TextField("Nome", text: $preset.label)
                 TextField("https://", text: $preset.website).keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
+                Toggle("Abrir em tela cheia", isOn: $fullscreen)
+                Button("Adicionar à coleção") { addShortcut() }
                 Button("Exportar .mobileconfig") { createProfile() }
                 Text("Cria um Web Clip removível, não substitui o ícone de um aplicativo instalado. Confira o perfil antes de instalar em Ajustes.").font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Coleção de atalhos") {
+                if shortcuts.isEmpty { Text("Adicione atalhos para exportá-los juntos.").foregroundStyle(.secondary) }
+                ForEach(shortcuts) { shortcut in
+                    HStack {
+                        if let data = shortcut.icon, let image = UIImage(data: data) {
+                            Image(uiImage: image).resizable().scaledToFill().frame(width: 36, height: 36).clipShape(RoundedRectangle(cornerRadius: 8))
+                        } else { Image(systemName: "globe").frame(width: 36, height: 36) }
+                        VStack(alignment: .leading) {
+                            Text(shortcut.label)
+                            Text(shortcut.url).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                }.onDelete { offsets in shortcuts.remove(atOffsets: offsets); persistShortcuts() }
+                Button("Exportar coleção (\(shortcuts.count))") { createProfile(collection: true) }.disabled(shortcuts.isEmpty)
             }
         }.navigationTitle("Temas e ícones")
     }
@@ -211,24 +242,51 @@ struct Dashboard: View {
         do { export = ExportFile(data: try JSONEncoder().encode(preset)); exportType = .json; exportName = "Milkbunga-Projeto"; exporting = true }
         catch { report(error.localizedDescription) }
     }
-    private func createProfile() {
+    private func currentShortcut() -> WebShortcut? {
         let label = preset.label.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !label.isEmpty, let url = URL(string: preset.website), url.scheme?.lowercased() == "https", let host = url.host, !host.isEmpty else {
-            report("Informe um nome e um endereço HTTPS válido."); return
+        guard !label.isEmpty, label.count <= 128,
+              let url = URL(string: preset.website), url.scheme?.lowercased() == "https",
+              let host = url.host, !host.isEmpty, url.user == nil, url.password == nil else {
+            report("Informe um nome e um endereço HTTPS válido."); return nil
+        }
+        return WebShortcut(label: label, url: url.absoluteString, icon: iconData, fullscreen: fullscreen)
+    }
+    private func persistShortcuts() {
+        if let data = try? JSONEncoder().encode(shortcuts) { savedShortcuts = data }
+    }
+    private func addShortcut() {
+        guard shortcuts.count < 50 else { report("Limite de 50 atalhos por coleção."); return }
+        guard let shortcut = currentShortcut() else { return }
+        shortcuts.append(shortcut)
+        persistShortcuts()
+        report("Atalho adicionado à coleção.")
+    }
+    private func createProfile(collection: Bool = false) {
+        let items: [WebShortcut]
+        if collection {
+            guard !shortcuts.isEmpty else { report("Coleção vazia."); return }
+            items = shortcuts
+        } else {
+            guard let shortcut = currentShortcut() else { return }
+            items = [shortcut]
         }
         let id = UUID().uuidString
-        var clip: [String: Any] = [
-            "PayloadType": "com.apple.webClip.managed", "PayloadVersion": 1,
-            "PayloadIdentifier": "com.reims.milkbunga.webclip." + id, "PayloadUUID": UUID().uuidString,
-            "PayloadDisplayName": label, "Label": label, "URL": url.absoluteString,
-            "IsRemovable": true, "FullScreen": false
-        ]
-        if let data = iconData { clip["Icon"] = data }
+        let clips: [[String: Any]] = items.map { shortcut in
+            var clip: [String: Any] = [
+                "PayloadType": "com.apple.webClip.managed", "PayloadVersion": 1,
+                "PayloadIdentifier": "com.reims.milkbunga.webclip." + UUID().uuidString, "PayloadUUID": UUID().uuidString,
+                "PayloadDisplayName": shortcut.label, "Label": shortcut.label, "URL": shortcut.url,
+                "IsRemovable": true, "FullScreen": shortcut.fullscreen
+            ]
+            if let data = shortcut.icon { clip["Icon"] = data }
+            return clip
+        }
         let profile: [String: Any] = [
             "PayloadType": "Configuration", "PayloadVersion": 1,
             "PayloadIdentifier": "com.reims.milkbunga.profile." + id, "PayloadUUID": UUID().uuidString,
-            "PayloadDisplayName": "Milkbunga: " + label, "PayloadDescription": "Atalho web removível criado localmente.",
-            "PayloadContent": [clip], "PayloadRemovalDisallowed": false
+            "PayloadDisplayName": "Milkbunga: " + (collection ? "Coleção" : items[0].label),
+            "PayloadDescription": "Atalhos web removíveis criados localmente.",
+            "PayloadContent": clips, "PayloadRemovalDisallowed": false
         ]
         do {
             export = ExportFile(data: try PropertyListSerialization.data(fromPropertyList: profile, format: .xml, options: 0))
