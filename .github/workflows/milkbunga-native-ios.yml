@@ -14,7 +14,8 @@ jobs:
       - name: Generate native project
         working-directory: NativeiOS
         run: |
-          brew install xcodegen
+          command -v xcodegen || brew install xcodegen
+          sips -z 1024 1024 Sources/Assets.xcassets/AppIcon.appiconset/AppIcon.png >/dev/null
           xcodegen generate
       - name: Compile for iPhone
         working-directory: NativeiOS
